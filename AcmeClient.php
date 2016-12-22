@@ -15,9 +15,9 @@ use AcmePhp\Core\Exception\AcmeCoreClientException;
 use AcmePhp\Core\Exception\AcmeCoreServerException;
 use AcmePhp\Core\Exception\Protocol\CertificateRequestFailedException;
 use AcmePhp\Core\Exception\Protocol\CertificateRequestTimedOutException;
-use AcmePhp\Core\Exception\Protocol\HttpChallengeFailedException;
-use AcmePhp\Core\Exception\Protocol\HttpChallengeNotSupportedException;
-use AcmePhp\Core\Exception\Protocol\HttpChallengeTimedOutException;
+use AcmePhp\Core\Exception\Protocol\ChallengeFailedException;
+use AcmePhp\Core\Exception\Protocol\ChallengeNotSupportedException;
+use AcmePhp\Core\Exception\Protocol\ChallengeTimedOutException;
 use AcmePhp\Core\Http\SecureHttpClient;
 use AcmePhp\Core\Protocol\AuthorizationChallenge;
 use AcmePhp\Core\Protocol\ResourcesDirectory;
@@ -78,11 +78,31 @@ class AcmeClient implements AcmeClientInterface
         $payload['resource'] = ResourcesDirectory::NEW_REGISTRATION;
         $payload['agreement'] = $agreement;
 
-        if ($email) {
+        if (is_string($email)) {
             $payload['contact'] = ['mailto:'.$email];
         }
 
-        return $this->requestResource('POST', ResourcesDirectory::NEW_REGISTRATION, $payload);
+        $response = (array) $this->requestResource('POST', ResourcesDirectory::NEW_REGISTRATION, $payload);
+        $links = $this->httpClient->getLastLinks();
+        foreach ($links as $link) {
+            if ('terms-of-service' === $link['rel']) {
+                $agreement = substr($link[0], 1, -1);
+                $payload = [];
+                $payload['resource'] = ResourcesDirectory::REGISTRATION;
+                $payload['agreement'] = $agreement;
+
+                $this->httpClient->signedRequest(
+                    'POST',
+                    $this->httpClient->getLastLocation(),
+                    $payload,
+                    true
+                );
+
+                break;
+            }
+        }
+
+        return $response;
     }
 
     /**
@@ -90,7 +110,7 @@ class AcmeClient implements AcmeClientInterface
      */
     public function requestAuthorization($domain)
     {
-        Assert::string($domain, 'requestChallenge::$domain expected a string. Got: %s');
+        Assert::string($domain, 'requestAuthorization::$domain expected a string. Got: %s');
 
         $payload = [
             'resource'   => ResourcesDirectory::NEW_AUTHORIZATION,
@@ -103,7 +123,7 @@ class AcmeClient implements AcmeClientInterface
         $response = $this->requestResource('POST', ResourcesDirectory::NEW_AUTHORIZATION, $payload);
 
         if (!isset($response['challenges']) || !$response['challenges']) {
-            throw new HttpChallengeNotSupportedException();
+            throw new ChallengeNotSupportedException();
         }
 
         $base64encoder = $this->httpClient->getBase64Encoder();
@@ -121,21 +141,18 @@ class AcmeClient implements AcmeClientInterface
 
         $encodedHeader = $base64encoder->encode(hash('sha256', $header, true));
 
+        $authorizationChallenges = [];
         foreach ($response['challenges'] as $challenge) {
-            if ('http-01' !== $challenge['type']) {
-                continue;
-            }
-
-            return new AuthorizationChallenge(
+            $authorizationChallenges[] = new AuthorizationChallenge(
                 $domain,
+                $challenge['type'],
                 $challenge['uri'],
                 $challenge['token'],
-                $challenge['token'].'.'.$encodedHeader,
-                $this->httpClient->getLastLocation()
+                $challenge['token'].'.'.$encodedHeader
             );
         }
 
-        throw new HttpChallengeNotSupportedException();
+        return $authorizationChallenges;
     }
 
     /**
@@ -143,34 +160,32 @@ class AcmeClient implements AcmeClientInterface
      */
     public function challengeAuthorization(AuthorizationChallenge $challenge, $timeout = 180)
     {
-        Assert::integer($timeout, 'checkChallenge::$timeout expected an integer. Got: %s');
+        Assert::integer($timeout, 'challengeAuthorization::$timeout expected an integer. Got: %s');
 
         $payload = [
             'resource'         => ResourcesDirectory::CHALLENGE,
-            'type'             => 'http-01',
+            'type'             => $challenge->getType(),
             'keyAuthorization' => $challenge->getPayload(),
             'token'            => $challenge->getToken(),
         ];
 
-        $response = $this->httpClient->signedRequest('POST', $challenge->getUrl(), $payload);
+        if (!$this->directory) {
+            $this->initializeDirectory();
+        }
 
+        $response = (array) $this->httpClient->signedRequest('POST', $challenge->getUrl(), $payload);
         // Waiting loop
         $endTime = time() + $timeout;
 
-        while (time() <= $endTime) {
-            $response = $this->httpClient->signedRequest('GET', $challenge->getLocation());
-
-            if ('pending' !== $response['status']) {
-                break;
-            }
-
+        while (time() <= $endTime && (!isset($response['status']) || 'pending' === $response['status'])) {
             sleep(1);
+            $response = (array) $this->httpClient->signedRequest('GET', $challenge->getUrl());
         }
 
-        if ('pending' === $response['status']) {
-            throw new HttpChallengeTimedOutException($response);
-        } elseif ('valid' !== $response['status']) {
-            throw new HttpChallengeFailedException($response);
+        if (!isset($response['status']) || 'valid' !== $response['status']) {
+            throw new ChallengeFailedException($response);
+        } elseif ('pending' === $response['status']) {
+            throw new ChallengeTimedOutException($response);
         }
 
         return $response;
@@ -264,9 +279,7 @@ class AcmeClient implements AcmeClientInterface
     protected function requestResource($method, $resource, array $payload, $returnJson = true)
     {
         if (!$this->directory) {
-            $this->directory = new ResourcesDirectory(
-                $this->httpClient->unsignedRequest('GET', $this->directoryUrl, null, true)
-            );
+            $this->initializeDirectory();
         }
 
         return $this->httpClient->signedRequest(
@@ -274,6 +287,16 @@ class AcmeClient implements AcmeClientInterface
             $this->directory->getResourceUrl($resource),
             $payload,
             $returnJson
+        );
+    }
+
+    /**
+     * Initialize the server resources directory.
+     */
+    private function initializeDirectory()
+    {
+        $this->directory = new ResourcesDirectory(
+            $this->httpClient->unsignedRequest('GET', $this->directoryUrl, null, true)
         );
     }
 }
